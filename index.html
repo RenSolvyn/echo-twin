@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'">
+<title>Echo Twin</title>
+<meta name="description" content="Map a room with sound from your phone. No camera, works offline.">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0b0d10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<canvas id="gl" aria-label="3D view of the room"></canvas>
+<canvas id="plan" aria-label="Floor plan of the room with measured wall distances" hidden></canvas>
+<canvas id="strip" aria-label="Live echoes: distance against heading while turning" hidden></canvas>
+
+<div id="hud" hidden>
+  <div class="hud-top">
+    <div id="dims" class="pill"></div>
+    <div id="status" class="pill subtle"></div>
+  </div>
+  <div id="meter" class="meter" hidden><span>Change</span><div class="bar"><i id="meterFill"></i></div></div>
+</div>
+
+<section id="home" class="screen">
+  <h1>Echo Twin</h1>
+  <p class="lead">Map the room around you with sound. No camera. Works offline.</p>
+  <button id="btnScan" class="primary">Scan my room</button>
+  <button id="btnSim" class="secondary">Try a simulated room</button>
+  <button id="btnOpen" class="link">Open a recording</button>
+  <p class="fine">Plays short high chirps and listens to their echoes. Nothing leaves your phone.</p>
+</section>
+
+<section id="primer" class="sheet" hidden>
+  <h2>Two permissions</h2>
+  <ul class="perm">
+    <li><b>Microphone</b> to hear the echoes of the chirps.</li>
+    <li><b>Motion</b> to know which way the phone points while you turn.</li>
+  </ul>
+  <p class="fine" id="primerNote">Audio stays on this phone. You can stop at any time.</p>
+  <button id="btnAllow" class="primary">Allow and continue</button>
+  <button id="btnNotNow" class="link">Not now</button>
+</section>
+
+<section id="scan" class="overlay" hidden>
+  <div class="steps"><i data-s="0"></i><i data-s="1"></i><i data-s="2"></i></div>
+  <h2 id="stepTitle"></h2>
+  <p id="stepText" class="lead"></p>
+  <div id="ring" class="ring"><span id="ringText"></span></div>
+  <p id="scanHint" class="hint" aria-live="polite"></p>
+  <button id="btnStep" class="primary" hidden>Start</button>
+  <button id="btnCancel" class="link">Cancel</button>
+</section>
+
+<nav id="bar" hidden>
+  <button id="btnRescan">Rescan</button>
+  <button id="btnRadar" aria-pressed="false">Radar</button>
+  <button id="btnView">Plan</button>
+  <button id="btnMore">More</button>
+</nav>
+
+<section id="more" class="sheet" hidden>
+  <h2>More</h2>
+  <button id="btnSpot" class="row" hidden>Record a second spot (field test)</button>
+  <button id="btnCalib" class="row" hidden>Calibrate with a tape measure</button>
+  <button id="btnField" class="row">Field test: compare with a tape measure</button>
+  <button id="btnExport" class="row">Save recording</button>
+  <button id="btnOpen2" class="row">Open a recording</button>
+  <button id="btnNewSim" class="row">New simulated room</button>
+  <button id="btnDetails" class="row">Details</button>
+  <button id="btnSettings" class="row">Settings</button>
+  <button id="btnAbout" class="row">Limits and how it works</button>
+  <button class="link close">Close</button>
+</section>
+
+<section id="details" class="sheet tall" hidden>
+  <h2>Details</h2>
+  <pre id="diag"></pre>
+  <button class="link close">Close</button>
+</section>
+
+<section id="field" class="sheet tall" hidden>
+  <h2>Field test</h2>
+  <p>Measure from the spot you turned on (between your feet) straight out to each wall, in the order you turned past them. The numbers are saved with the recording.</p>
+  <label>Wall distances (m), comma separated
+    <input id="fieldWalls" type="text" inputmode="decimal" placeholder="1.42, 2.10, 2.65, 1.88">
+  </label>
+  <label>Room height, floor to ceiling (m)
+    <input id="fieldRoomH" type="number" step="0.01" min="1.5" max="6">
+  </label>
+  <label>Phone height at the end of the lift (m)
+    <input id="fieldPhoneH" type="number" step="0.01" min="0.3" max="2.5">
+  </label>
+  <button id="btnFieldScore" class="primary">Save and compare</button>
+  <pre id="fieldOut"></pre>
+  <button class="link close">Close</button>
+</section>
+
+<section id="calib" class="sheet tall" hidden>
+  <h2>Tape calibration</h2>
+  <p>Every distance from one scan shares the same small errors (air temperature, where the speaker and microphone sit). Tape one wall and all walls, the floor and the ceiling are corrected. Two walls at clearly different distances also fix the scale.</p>
+  <div id="calibWallRow" hidden>
+    <label><span id="calibWallLabel"></span>
+      <input id="calibTape" type="number" inputmode="decimal" step="0.01" min="0.3" max="15" placeholder="1.42">
+    </label>
+    <button id="btnCalibSave" class="primary">Save and correct</button>
+  </div>
+  <button id="btnCalibPick" class="secondary">Pick a wall on the plan</button>
+  <pre id="calibOut"></pre>
+  <button id="btnCalibClear" class="link">Clear calibration</button>
+  <button class="link close">Close</button>
+</section>
+
+<section id="settings" class="sheet" hidden>
+  <h2>Settings</h2>
+  <label>Chirp band
+    <select id="setBand"><option value="auto">Automatic</option><option value="high">Near-ultrasonic 16-20 kHz</option><option value="audible">Audible 3-9 kHz</option><option value="wide">Wideband 2-20 kHz (loud)</option></select>
+  </label>
+  <label>Second microphone (phones that expose two)
+    <select id="setStereo"><option value="auto">Automatic</option><option value="on">Use it for echo direction</option><option value="off">Off</option></select>
+  </label>
+  <label>Phone type
+    <select id="setDevice"><option value="auto">Detect</option><option value="android">Android</option><option value="iphone">iPhone</option><option value="other">Other</option></select>
+  </label>
+  <label>Air temperature (C)
+    <input id="setTemp" type="number" min="-20" max="45" step="1">
+  </label>
+  <label class="check"><input id="setModel" type="checkbox"> Use the trained echo model</label>
+  <button id="btnSaveSettings" class="primary">Save</button>
+  <button class="link close">Close</button>
+</section>
+
+<section id="about" class="sheet tall" hidden>
+  <h2>Limits and how it works</h2>
+  <p>The phone chirps every 0.12 s while you turn on the spot. Each wall echoes at a range that rises and falls as the phone swings around you; that pattern gives the wall's direction and distance. The floor and ceiling are found while you raise the phone.</p>
+  <p>Walls drawn dashed and amber are inferred from weak evidence. Colours of measured walls go from cyan (within a few cm) to yellow (less certain).</p>
+  <p>Radar mode alternates up and down sweeps. A moving person shifts the two in opposite directions, which gives their speed toward or away from you. One phone measures distance and speed, not the exact direction of a moving person.</p>
+  <p>The plan shows each measured wall with its distance from the spot you turned on, the same number a tape from that spot would read, and a band as wide as its uncertainty. Dashed amber edges are sides the scan could not hear. While you turn, the strip at the top shows every echo as distance against heading; a wall draws a wave, and the solver's walls are the yellow curves.</p>
+  <p>Phones that give the browser two microphone channels (some Android phones in Chrome) also measure the direction of each echo from the delay between the microphones. In simulation that found more walls and fewer wrong ones; Details says whether your phone does it.</p>
+  <p>A second spot can be recorded for the field test. Fitting two spots together from the walls alone is not reliable yet, so the plan shows the first spot only.</p>
+  <p><b>Limits:</b> each spot maps the convex space around it; stand about a metre from walls and away from big furniture; very soft rooms (curtains, sofas) echo weakly. Accuracy so far is measured in simulation only. iPhone Safari sends sound to the earpiece while the microphone is open, which makes it quieter, and gives one microphone channel.</p>
+  <button class="link close">Close</button>
+</section>
+
+<div id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="fileIn" accept=".json,application/json" hidden>
+<script type="module" src="app/main.js"></script>
+</body>
+</html>
