@@ -7,7 +7,7 @@ import { EchoStrip } from './radargram.js';
 import { registerSpots, mergeSpots, framesBySpot, MERGE } from '../core/merge.js';
 import { fitCalibration, applyCalibration, CALIB_SAVE, CALIB_ENABLED } from '../core/calib.js';
 import { stereoSetup, STEREO_DEFAULT, nearFar } from '../core/stereo.js';
-import { LIVE_ENABLED } from '../core/live.js';
+import { LIVE_ENABLED, CLOUD_ENABLED } from '../core/live.js';
 import { roomPolygon } from '../core/geom.js';
 import { parseTruth, scoreField, fieldText } from '../core/fieldscore.js';
 import { persistenceCandidates } from '../core/estimate.js';
@@ -67,12 +67,50 @@ function startLiveWalls(procIn) {
   if (!LIVE_ENABLED || !S.liveModels || !proc) return;
   if (!S.liveWorker) {
     S.liveWorker = new Worker(new URL('./liveworker.js', import.meta.url), { type: 'module' });
-    S.liveWorker.onmessage = (e) => onLiveWalls(e.data);
+    S.liveWorker.onmessage = (e) => (e.data.type === 'cloud' ? onLiveCloud(e.data) : onLiveWalls(e.data));
   }
   const p = proc;
   S.liveProc = proc;
   S.liveWorker.postMessage({ type: 'start', proc: { fs: p.fs, f0: p.f0, f1: p.f1, chirpDur: p.chirpDur, c: p.c, rangeOffset: p.rangeOffset, maxRange: p.maxRange, binSize: p.binSize, kappa: p.kappa }, echo: S.liveModels.echo, live: S.liveModels.live, stereo: null });
   S.liveOn = true; S.liveStereo = null; S.liveMs = [];
+  S.cloudMs = []; S.cloudUpdates = 0; S.cloudFinal = false; S.cloudWanted = false;
+  plan.clearCloud();
+}
+
+// Echo cloud (v0.6.1): the live wall evidence as a glow on the plan, with an outline along its strongest ridge.
+// Live updates while turning; one final cloud when the turn ends (asked for, so it covers every chirp).
+function onLiveCloud(d) {
+  if (!(S.liveOn || (d.final && S.cloudWanted))) return;
+  if (d.empty) { if (d.final) { S.cloudWanted = false; S.cloudFinal = true; } return; }
+  S.cloudMs.push(d.ms); S.cloudUpdates++;
+  plan.setCloud(d, S.spot);
+  if (d.final) { S.cloudWanted = false; S.cloudFinal = true; }
+}
+function requestFinalCloud() {
+  if (!CLOUD_ENABLED || !S.liveWorker) return;
+  S.cloudWanted = true; S.liveWorker.postMessage({ type: 'cloud' });
+}
+function noteCloudTiming() {
+  if (S.cloudMs && S.cloudMs.length) { const s = S.cloudMs.slice().sort((a, b) => a - b); S.diag.cloudMsP95 = +s[Math.floor(0.95 * (s.length - 1))].toFixed(1); }
+}
+
+// Cloud for an opened recording: the same worker runs over the first spot's turn, quietly (no live walls drawn).
+function cloudForReplay(frames, proc) {
+  if (!CLOUD_ENABLED || !LIVE_ENABLED || !S.liveModels || !proc) return;
+  if (!S.liveWorker) { S.liveWorker = new Worker(new URL('./liveworker.js', import.meta.url), { type: 'module' }); S.liveWorker.onmessage = (e) => (e.data.type === 'cloud' ? onLiveCloud(e.data) : onLiveWalls(e.data)); }
+  const p = proc;
+  S.liveOn = false; S.cloudMs = []; S.cloudUpdates = 0; S.cloudFinal = false; plan.clearCloud();
+  S.liveWorker.postMessage({ type: 'start', proc: { fs: p.fs, f0: p.f0, f1: p.f1, chirpDur: p.chirpDur, c: p.c, rangeOffset: p.rangeOffset, maxRange: p.maxRange, binSize: p.binSize, kappa: p.kappa }, echo: S.liveModels.echo, live: S.liveModels.live, stereo: null });
+  const F = frames.filter(f => (f.spot || 0) === 0);
+  const st = stereoFor(F, proc);
+  if (st) S.liveWorker.postMessage({ type: 'stereo', stereo: st });
+  for (let i = 0; i < F.length; i++) {
+    const f = F[i], a = F[i - 2];
+    const omega = a ? (f.yaw - a.yaw) / Math.max(0.05, f.t - a.t) : 0;
+    const nf = st && f.profile2 ? nearFar(f, st) : null;
+    S.liveWorker.postMessage({ type: 'chirp', f: { yaw: f.yaw, omega, phase: f.phase, dir: f.dir, profile: nf ? nf.near : f.profile, far: nf ? nf.far : null, seg: f.seg } });
+  }
+  requestFinalCloud();
 }
 
 function sendLive(f) {
@@ -186,13 +224,19 @@ function setView(m) {
   $('btnView').textContent = m === 'plan' ? 'Plan' : m === 'follow' ? '3D' : 'Orbit';
 }
 
+// Fewer than 2 measured walls is not a room (field error E126): no walls, no outline polygon, no 3D room;
+// the plan shows the echo cloud alone and says what to change.
+function measuredCount(room) { return room && room.ok ? room.walls.filter(w => !w.inferred).length : 0; }
+const NO_WALLS = 'No walls measured from here. The glow shows where echoes came from. Hold the phone at arm\'s length and turn slowly, about a metre from walls.';
+
 function showRoom(room) {
   S.room = room;
-  view.setRoom(room.merged ? { ...room, poly: room.cells[0] } : room);
-  plan.setRoom(room);
+  S.cloudOnly = !room.merged && measuredCount(room) < 2;
+  view.setRoom(S.cloudOnly ? null : room.merged ? { ...room, poly: room.cells[0] } : room);
+  plan.setRoom(room, { cloudOnly: S.cloudOnly });
   plan.setPhone(null);
   show('hud'); show('bar');
-  $('dims').textContent = roomSummary(room) + (room.merged ? '  |  2 spots' : '') + (room.calibration ? '  |  tape calibrated' : '');
+  $('dims').textContent = S.cloudOnly ? NO_WALLS : roomSummary(room) + (room.merged ? '  |  2 spots' : '') + (room.calibration ? '  |  tape calibrated' : '');
   $('btnSpot').hidden = !(S.source === 'live' && S.audio && S.spotRooms.length === 1);
   $('btnCalib').hidden = !CALIB_ENABLED;
   setView(S.userView || 'plan');
@@ -337,7 +381,7 @@ function turnProgress(f) {
 
 async function finishScan() {
   S.finished = true;
-  if (S.liveOn) { S.liveOn = false; plan.endLive(); if (S.liveMs.length) { const s = S.liveMs.slice().sort((a, b) => a - b); S.diag.liveMsP95 = s[Math.floor(0.95 * s.length)]; } }
+  if (S.liveOn) { requestFinalCloud(); S.liveOn = false; plan.endLive(); noteCloudTiming(); if (S.liveMs.length) { const s = S.liveMs.slice().sort((a, b) => a - b); S.diag.liveMsP95 = s[Math.floor(0.95 * s.length)]; } }
   S.audio.stopTrain();
   setStep(2, 'Building the room', S.spot ? 'Solving the second spot, then fitting it to the first.' : 'Solving the walls, floor and ceiling.');
   const opt = { kappa: S.audio.proc.kappa, bwKHz: (S.band.f1 - S.band.f0) / 1000, persist: true };
@@ -348,6 +392,7 @@ async function finishScan() {
     if (!res.ok) { show('home'); toast(res.reason, 4000); return; }
     S.spotRooms = [res];
     showRoom(composeRoom(res));
+    if (S.cloudOnly) { toast('No walls measured. Showing where echoes came from.', 3600); return; }
     toast(res.confident ? 'Room ready' : 'Room ready. Walls it could not hear are dashed; add a second spot to fill them in.', 3200);
     startRadar();
     return;
@@ -373,6 +418,7 @@ function startSecondSpot() {
   $('btnStep').onclick = () => {
     $('btnStep').hidden = true;
     S.spot = 1; S.finished = false;
+    startLiveWalls();
     S.audio.period = DEFAULTS.period;
     S.audio.onFrame = (q) => onScanFrame(q);
     S.audio.startTrain({ phase: 'turn' });
@@ -384,7 +430,7 @@ function startSecondSpot() {
 function radarRoom() { const r = S.spotRooms[S.spot] || S.room; return S.cal && r ? applyCalibration(r, S.cal) : r; }
 
 function startRadar() {
-  if (!S.room || !S.room.ok) return;
+  if (!S.room || !S.room.ok || S.cloudOnly) return;
   const turn = S.frames.filter(f => f.phase === 'turn' && (f.spot || 0) === S.spot);
   if (S.source === 'live' && S.audio) {
     const kappa = S.audio.proc.kappa;
@@ -468,7 +514,7 @@ async function simDemo(seed) {
     step();
   });
   setStep(2, 'Building the room', 'Solving the walls, floor and ceiling.');
-  if (S.liveOn) { await new Promise(r => setTimeout(r, 400)); S.liveOn = false; plan.endLive(); if (S.liveMs.length) { const s = S.liveMs.slice().sort((a, b) => a - b); S.diag.liveMsP95 = s[Math.floor(0.95 * s.length)]; } }
+  if (S.liveOn) { await new Promise(r => setTimeout(r, 400)); requestFinalCloud(); S.liveOn = false; plan.endLive(); noteCloudTiming(); if (S.liveMs.length) { const s = S.liveMs.slice().sort((a, b) => a - b); S.diag.liveMsP95 = s[Math.floor(0.95 * s.length)]; } }
   const res = await solve(S.frames, { kappa: sim.proc.kappa, bwKHz: (sc.band.f1 - sc.band.f0) / 1000, persist: true }, sim.proc);
   hide('scan'); hide('strip');
   if (!res.ok) { toast(res.reason, 4000); show('home'); return; }
@@ -487,6 +533,7 @@ async function simDemo(seed) {
 }
 
 function simRadar() {
+  if (S.cloudOnly) return;
   const { sc, sim } = S.sim;
   const turn = S.frames.filter(f => f.phase === 'turn');
   S.twin = new LiveTwin(S.room, turn, { kappa: sim.proc.kappa });
@@ -556,6 +603,7 @@ async function openRecording(file) {
     S.diag.registration = S.spotRegs ? (S.spotRegs.ok ? { t: S.spotRegs.t, dhDeg: S.spotRegs.dh * 180 / Math.PI, score: S.spotRegs.score, second: S.spotRegs.second } : { failed: S.spotRegs.reason }) : null;
     if (m.tape && m.tape.length) { S.calPairs = m.tape; S.cal = fitCalibration(S.calPairs); }
     const shown = composeRoom(res);
+    cloudForReplay(S.frames, proc);
     showRoom(shown);
     const fs0 = m.truth ? scoreField(shown, m.truth) : null;
     const nSpots = framesBySpot(S.frames).length;
@@ -671,13 +719,13 @@ $('btnCancel').onclick = async () => {
   if (S.spot > 0 && S.spotRooms.length) { S.audio.stopTrain(); S.frames = S.frames.filter(f => f.spot === 0); S.spot = 0; hide('scan'); showRoom(composeRoom()); toast('Second spot cancelled'); return; }
   if (S.audio) await S.audio.close(); S.audio = null; hide('scan'); show('home'); toast('Scan cancelled');
 };
-$('btnRescan').onclick = async () => { stopRadar(); S.finished = false; if (S.audio) { await S.audio.close(); S.audio = null; } hide('bar'); hide('hud'); view.setTruth(null); view.setRoom(null); plan.setTruth(null); plan.setRoom(null); S.spotRooms = []; S.spotRegs = null; startScan(); };
+$('btnRescan').onclick = async () => { stopRadar(); S.finished = false; if (S.audio) { await S.audio.close(); S.audio = null; } hide('bar'); hide('hud'); view.setTruth(null); view.setRoom(null); plan.setTruth(null); plan.setRoom(null); plan.clearCloud(); S.spotRooms = []; S.spotRegs = null; startScan(); };
 $('btnSpot').onclick = startSecondSpot;
 $('btnCalib').onclick = () => { S.calWall = null; openCalib(); };
 $('btnCalibPick').onclick = pickWallForCalib;
 $('btnCalibSave').onclick = saveCalib;
 $('btnCalibClear').onclick = clearCalib;
-$('btnRadar').onclick = () => { if (S.radar) { stopRadar(); toast('Radar off'); } else if (S.source === 'sim') { simRadar(); toast('Radar on'); } else if (S.audio) { startRadar(); toast('Radar on'); } else toast('Scan a room first'); };
+$('btnRadar').onclick = () => { if (S.radar) { stopRadar(); toast('Radar off'); } else if (S.cloudOnly) toast('No measured walls to watch yet'); else if (S.source === 'sim') { simRadar(); toast('Radar on'); } else if (S.audio) { startRadar(); toast('Radar on'); } else toast('Scan a room first'); };
 $('btnMore').onclick = () => sheet('more');
 $('btnExport').onclick = exportRecording;
 const VIEWS = ['plan', 'follow', 'orbit'];
@@ -702,7 +750,7 @@ $('btnAbout').onclick = () => sheet('about');
 document.addEventListener('visibilitychange', () => { if (document.hidden && S.radar && S.source === 'live') stopRadar(); });
 
 // test hook (tools/e2e.mjs): screen point of a measured wall on the plan
-window.__et = { live: () => ({ on: !!S.liveOn, models: !!S.liveModels, chirps: (S.liveMs || []).length, shown: S.liveWallsShown || 0 }), wallPoint: (i) => plan.wallPoint(i), wallLabel: (i) => PlanView.wallLabel(S.room, i).text, measuredWalls: () => S.room ? S.room.walls.map((w, i) => w.inferred ? -1 : i).filter(i => i >= 0) : [] };
+window.__et = { cloud: () => ({ updates: S.cloudUpdates || 0, final: !!S.cloudFinal, only: !!S.cloudOnly, ridges: plan.cloudRidgeCount(), dims: $('dims').textContent }), live: () => ({ on: !!S.liveOn, models: !!S.liveModels, chirps: (S.liveMs || []).length, shown: S.liveWallsShown || 0 }), wallPoint: (i) => plan.wallPoint(i), wallLabel: (i) => PlanView.wallLabel(S.room, i).text, measuredWalls: () => S.room ? S.room.walls.map((w, i) => w.inferred ? -1 : i).filter(i => i >= 0) : [] };
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
 loadLiveModels();
 loadModel().then(() => {

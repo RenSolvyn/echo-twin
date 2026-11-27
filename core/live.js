@@ -13,6 +13,8 @@ export const RHOS = [0.15, 0.25, 0.35, 0.45];
 // Live grid: 1 deg by 2 cm (half the final solver's range resolution; peaks are refined below a bin).
 export const LGRID = { nPhi: 360, d0: 0.2, dStep: 0.02 };
 export const N_WFEAT = 14;
+// Echo cloud grid (frozen by the v0.6.1 pre-registration, SANDBOX.md).
+export const CLOUD = { nB: 120, r0: 0.4, r1: 6.0, dr: 0.025, flat: 40, zero: 65 };
 const JMAX = 180, COSJ = new Float64Array(2 * JMAX + 1), SINJ = new Float64Array(2 * JMAX + 1);
 for (let j = -JMAX; j <= JMAX; j++) { COSJ[j + JMAX] = Math.cos(j * DEG); SINJ[j + JMAX] = Math.sin(j * DEG); }
 
@@ -129,11 +131,60 @@ export class LiveWalls {
     return kept;
   }
 
+  // Best hold radius's map, blurred and ridge-removed; cached until the next chirp (it lives in this.sm).
+  // Time O(4 x 360 x nD) when stale, O(1) when cached.
+  map() {
+    if (this.mapK !== this.hist.length) {
+      this.mapRi = this.bestRho();
+      LiveWalls.deridgeFast(this.blurInto(this.acc[this.mapRi]), LGRID.nPhi, this.nD);
+      this.mapK = this.hist.length;
+    }
+    return { rho: RHOS[this.mapRi], m: this.sm };
+  }
+
+  // Echo cloud (v0.6.1, SANDBOX.md): the wall evidence projected back to the floor, read along bearings every
+  // 3 deg (heading frame) at ranges r0..r1. A point at bearing a, range r takes the largest positive evidence
+  // over wall angles phi within CLOUD.zero deg of a at wall distance r cos(a - phi), times a window that is 1 up
+  // to CLOUD.flat deg and falls to 0 at CLOUD.zero deg. Outline: per bearing, the range of the strongest value
+  // (pre-registered rule; the farthest value lands on double-bounce ghosts). Returns { rho, nB, nR, r0, dr,
+  // heat (Uint8Array nB x nR, scaled to the cloud's largest value), ridge (m, NaN when empty), strength (0..1) }.
+  // Time O(nB x (2 zero + 1) x nR), about 3.5 M steps; space O(nB x nR).
+  cloud() {
+    const { nB, r0, r1, dr, flat, zero } = CLOUD, nR = Math.round((r1 - r0) / dr) + 1;
+    const { rho, m } = this.map(), nD = this.nD, { d0, dStep, nPhi } = LGRID;
+    const prof = new Float32Array(nB * nR), ridge = new Float32Array(nB), strength = new Float32Array(nB);
+    const nq = 2 * zero + 1, cq = new Float64Array(nq), wq = new Float64Array(nq);
+    for (let q = -zero; q <= zero; q++) { const a = Math.abs(q); cq[q + zero] = Math.cos(q * DEG); wq[q + zero] = a <= flat ? 1 : a >= zero ? 0 : (zero - a) / (zero - flat); }
+    const anchor = this.anchor ?? 0;
+    let gmax = 0;
+    for (let b = 0; b < nB; b++) {
+      const base = b * (360 / nB), o = b * nR;
+      for (let q = -zero; q <= zero; q++) {
+        const w = wq[q + zero]; if (w <= 0) continue;
+        let pp = Math.round(base + q - anchor) % nPhi; if (pp < 0) pp += nPhi;
+        const col = pp * nD, c = cq[q + zero];
+        for (let i = 0; i < nR; i++) {
+          const ii = Math.round(((r0 + i * dr) * c - d0) / dStep);
+          if (ii < 0 || ii >= nD) continue;
+          const v = m[col + ii] * w;
+          if (v > prof[o + i]) prof[o + i] = v;
+        }
+      }
+      let mx = 0, im = -1;
+      for (let i = 0; i < nR; i++) if (prof[o + i] > mx) { mx = prof[o + i]; im = i; }
+      ridge[b] = im >= 0 ? r0 + im * dr : NaN; strength[b] = mx;
+      if (mx > gmax) gmax = mx;
+    }
+    const heat = new Uint8Array(nB * nR), s = gmax > 0 ? 255 / gmax : 0;
+    for (let i = 0; i < heat.length; i++) heat[i] = Math.round(prof[i] * s);
+    for (let b = 0; b < nB; b++) strength[b] = gmax > 0 ? strength[b] / gmax : 0;
+    return { rho, nB, nR, r0, dr, heat, ridge, strength, prof };
+  }
+
   // Peaks of the best hold-radius map, with features. Time O(360 x nD).
   peaks() {
     if (this.hist.length < 8) return { rho: null, peaks: [] };
-    const ri = this.bestRho(), rho = RHOS[ri];
-    const m = LiveWalls.deridgeFast(this.blurInto(this.acc[ri]), LGRID.nPhi, this.nD);
+    const { rho, m } = this.map();
     const pk = this.findPeaks(m);
     const K = this.hist.length, top = pk.length ? pk[0].s : 1;
     const at = (p, i) => m[((p + LGRID.nPhi) % LGRID.nPhi) * this.nD + Math.max(0, Math.min(this.nD - 1, i))];
@@ -185,3 +236,9 @@ export class LiveWalls {
 // Adopted 2026-11-27: displayed-wall precision 0.93 at 75 % and 0.87 at 100 % of the turn (lower bounds 0.85 and
 // 0.77), worst per-chirp p95 9.2 ms. Sparse: about half a wall per room by the end of the turn (recall 0.09).
 export const LIVE_ENABLED = true;
+
+// Whether the plan view draws the echo cloud; set only by the pre-registered sealed test (SANDBOX.md v0.6.1).
+// Adopted 2026-11-27 on 50 fresh rooms: strongest-ridge outline within 15 cm on 0.38 of bearings vs 0.10 with
+// directions scrambled (difference +0.28, CI +0.23 to +0.33); strongest beats farthest by +0.31 (CI +0.26 to
+// +0.36). The solver stays ahead (+0.10, CI +0.03 to +0.17), so the cloud is evidence on screen, never walls.
+export const CLOUD_ENABLED = true;

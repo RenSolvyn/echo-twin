@@ -1,5 +1,5 @@
 // Offline cache: every app file is cached on install; cache-first with background refresh.
-const CACHE = 'echo-twin-v0.6.0';
+const CACHE = 'echo-twin-v0.6.1';
 const FILES = [
   './', 'index.html', 'app.css', 'manifest.webmanifest', 'rec-worklet.js',
   'app/main.js', 'app/audio.js', 'app/sensors.js', 'app/view3d.js', 'app/plan2d.js', 'app/radargram.js', 'app/worker.js', 'app/liveworker.js',
