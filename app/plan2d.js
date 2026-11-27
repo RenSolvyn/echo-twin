@@ -28,7 +28,19 @@ export class PlanView {
   }
 
   show(on) { this.on = on; this.c.hidden = !on; if (on) { this.resize(); this.draw(); } }
-  setRoom(room) { this.room = room && room.ok ? room : null; this.sel = -1; this.fit(); this.dirty = true; }
+  setRoom(room) { this.room = room && room.ok ? room : null; this.sel = -1; this.liveMode = false; this.fit(); this.dirty = true; }
+
+  // Live walls during the turn: the view only grows (no zoom jumps); room-scale bounds from the start.
+  setLive(room, heading) {
+    if (!this.liveMode) { this.liveMode = true; this.saved = { top: this.insetTop, bottom: this.insetBottom }; this.insetTop = 170; this.insetBottom = Math.round(this.h * 0.42); this.bx = [-3, 3]; this.by = [-3, 3]; this.rot = 0; }
+    this.room = room; this.heading = heading;
+    for (const s of this.segments()) for (const p of [s.a, s.b]) {
+      const c = Math.cos(this.rot), si = Math.sin(this.rot), u = c * p[0] - si * p[1], v = si * p[0] + c * p[1];
+      if (Math.abs(u) < 8 && Math.abs(v) < 8) { this.bx = [Math.min(this.bx[0], u - 0.3), Math.max(this.bx[1], u + 0.3)]; this.by = [Math.min(this.by[0], v - 0.3), Math.max(this.by[1], v + 0.3)]; }
+    }
+    this.dirty = true;
+  }
+  endLive() { if (this.liveMode && this.saved) { this.insetTop = this.saved.top; this.insetBottom = this.saved.bottom; } this.liveMode = false; }
   setTruth(poly) { this.truth = poly; this.fit(); this.dirty = true; }
   setSelected(i) { this.sel = i; this.dirty = true; }
   setPhone(heading, spot = 0, rho = 0.3) { this.heading = heading; this.spot = spot; this.rho = rho; this.dirty = true; }
@@ -75,6 +87,7 @@ export class PlanView {
   }
 
   fit() {
+    if (this.liveMode) return;
     const pts = [];
     for (const s of this.segments()) pts.push(s.a, s.b);
     if (this.truth) pts.push(...this.truth);

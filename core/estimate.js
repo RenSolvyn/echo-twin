@@ -309,7 +309,7 @@ export function horizontalPlanes(liftFrames, inv, opt = {}) {
 
 // ---------- Hough over (phi, d) for a given hold radius ----------
 
-const GRID = { nPhi: 360, d0: 0.2, dStep: 0.01 };
+export const GRID = { nPhi: 360, d0: 0.2, dStep: 0.01 };
 const JMAX = 180;
 const COSJ = new Float64Array(2 * JMAX + 1), SINJ = new Float64Array(2 * JMAX + 1);
 for (let j = -JMAX; j <= JMAX; j++) { COSJ[j + JMAX] = Math.cos(j * DEG); SINJ[j + JMAX] = Math.sin(j * DEG); }
@@ -346,7 +346,7 @@ export function houghAcc(cands, rho, kappa, nD) {
 
 // A wall is a localized peak in phi; anything constant across phi at one d (leftovers of floor,
 // ceiling, body and ringing) is a ridge. Subtract each range row's median over phi.
-function deridge(acc, nPhi, nD) {
+export function deridge(acc, nPhi, nD) {
   const col = new Float32Array(nPhi);
   for (let i = 0; i < nD; i++) {
     for (let p = 0; p < nPhi; p++) col[p] = acc[p * nD + i];
@@ -357,7 +357,7 @@ function deridge(acc, nPhi, nD) {
   return acc;
 }
 
-function blur(acc, nPhi, nD) {
+export function blur(acc, nPhi, nD) {
   const k = [1 / 16, 4 / 16, 6 / 16, 4 / 16, 1 / 16];
   const tmp = new Float32Array(acc.length), out = new Float32Array(acc.length);
   for (let p = 0; p < nPhi; p++) {
@@ -960,7 +960,7 @@ export function solveScan(frames, opt = {}) {
   // audit only (tools/audit.mjs): lets an oracle replace or filter the candidates; unset in the app
   if (opt.candidateHook) cands = opt.candidateHook(cands, turn);
   const s0 = opt.persistS0 ?? EST.persistS0;
-  for (const c of cands) c.w = useP ? c.score / (c.score + s0) : c.score;
+  for (const c of cands) c.w = c.wGiven != null ? c.wGiven : useP ? c.score / (c.score + s0) : c.score;
   if (st) attachCos(cands, turn, st, opt.binSize ?? EST.binSize);
   const maxRange = opt.maxRange ?? EST.maxRange;
   const nD = Math.ceil((maxRange + 0.8 - GRID.d0) / GRID.dStep);

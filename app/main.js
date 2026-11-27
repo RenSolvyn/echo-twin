@@ -6,7 +6,9 @@ import { PlanView } from './plan2d.js';
 import { EchoStrip } from './radargram.js';
 import { registerSpots, mergeSpots, framesBySpot, MERGE } from '../core/merge.js';
 import { fitCalibration, applyCalibration, CALIB_SAVE, CALIB_ENABLED } from '../core/calib.js';
-import { stereoSetup, STEREO_DEFAULT } from '../core/stereo.js';
+import { stereoSetup, STEREO_DEFAULT, nearFar } from '../core/stereo.js';
+import { LIVE_ENABLED } from '../core/live.js';
+import { roomPolygon } from '../core/geom.js';
 import { parseTruth, scoreField, fieldText } from '../core/fieldscore.js';
 import { persistenceCandidates } from '../core/estimate.js';
 import { SonarAudio } from './audio.js';
@@ -51,6 +53,48 @@ document.querySelectorAll('.sheet .close').forEach(b => b.addEventListener('clic
 const fmt = (v, d = 2) => (v == null || !Number.isFinite(v)) ? '-' : v.toFixed(d);
 
 function scorer() { return S.settings.model && S.mlp ? (x) => S.mlp.score(x) : null; }
+
+async function loadLiveModels() {
+  try {
+    const [e, w] = await Promise.all(['echo-e.json', 'live-w.json'].map(n => fetch(new URL('../model/' + n, import.meta.url)).then(r => r.ok ? r.json() : null)));
+    S.liveModels = e && w ? { echo: e, live: w } : null;
+  } catch (err) { S.liveModels = null; }
+}
+
+// Live walls during the turn (v0.6): a separate worker runs the echo model and the live decoder per chirp.
+function startLiveWalls(procIn) {
+  const proc = procIn || (S.audio && S.audio.proc);
+  if (!LIVE_ENABLED || !S.liveModels || !proc) return;
+  if (!S.liveWorker) {
+    S.liveWorker = new Worker(new URL('./liveworker.js', import.meta.url), { type: 'module' });
+    S.liveWorker.onmessage = (e) => onLiveWalls(e.data);
+  }
+  const p = proc;
+  S.liveProc = proc;
+  S.liveWorker.postMessage({ type: 'start', proc: { fs: p.fs, f0: p.f0, f1: p.f1, chirpDur: p.chirpDur, c: p.c, rangeOffset: p.rangeOffset, maxRange: p.maxRange, binSize: p.binSize, kappa: p.kappa }, echo: S.liveModels.echo, live: S.liveModels.live, stereo: null });
+  S.liveOn = true; S.liveStereo = null; S.liveMs = [];
+}
+
+function sendLive(f) {
+  if (!S.liveOn) return;
+  if (!S.liveStereo && f.phase === 'turn' && f.profile2 && S.settings.stereo !== 'off' && (S.settings.stereo === 'on' || STEREO_DEFAULT)) {
+    const st = stereoSetup(S.frames.filter(x => (x.spot || 0) === S.spot), S.liveProc);
+    if (st.ok) { S.liveStereo = st; S.liveWorker.postMessage({ type: 'stereo', stereo: st }); }
+  }
+  const nf = S.liveStereo && f.profile2 ? nearFar(f, S.liveStereo) : null;
+  S.liveWorker.postMessage({ type: 'chirp', f: { yaw: f.yaw, omega: f.omega || 0, phase: f.phase, dir: f.dir, profile: nf ? nf.near : f.profile, far: nf ? nf.far : null, seg: f.seg } });
+}
+
+function onLiveWalls(d) {
+  if (!S.liveOn || S.finished) return;
+  S.liveMs.push(d.ms);
+  const walls = d.walls || [];
+  if (walls.length) strip.setFit(walls, d.rho);
+  const pg = walls.length >= 2 ? roomPolygon(walls) : null;
+  const last = S.frames[S.frames.length - 1];
+  plan.setLive({ ok: true, walls: walls.map(w => ({ ...w, sD: 0.03 })), poly: pg ? pg.poly : [], edgeWall: pg ? pg.edgeWall : [] }, last ? last.yaw : null);
+  S.liveWallsShown = walls.length;
+}
 
 async function loadModel() {
   try {
@@ -204,6 +248,7 @@ async function allowAndGo() {
   S.cal = CALIB_SAVE ? store.get('calib.' + dev, null) : null;
   S.tStart = performance.now();
   S.audio.onFrame = (q) => onScanFrame(q);
+  startLiveWalls();
   setStep(1, 'Raise the phone', 'Hold it flat, screen up, top edge toward you, at waist height. Tap Start, then raise it slowly to your chest.');
   setRing(0, '');
   $('btnStep').hidden = false; $('btnStep').textContent = 'Start';
@@ -225,9 +270,12 @@ function onScanFrame(q) {
   const f = processFrame(q);
   if (q.phase === 'live') return onLiveFrame(f);
   S.frames.push(f);
+  if (S.frames.length > 2) { const a = S.frames[S.frames.length - 3]; f.omega = (f.yaw - a.yaw) / Math.max(0.05, f.t - a.t); }
+  sendLive(f);
   view.setHeading(f.yaw);
   const le = liveEchoes(f);
   view.addEchoes(le.echoes);
+  if (S.liveOn && q.phase === 'turn') plan.addEchoes(le.echoes, f.yaw, 0, 0.3);
   if (q.phase === 'turn') {
     if (le.residual) strip.add(f.yaw, le.residual, S.audio.proc.binSize);
     turnProgress(f);
@@ -239,8 +287,9 @@ function beginTurn(title, text) {
   S.turnYaw0 = S.motion.yawAt(performance.now());
   S.liveBuf = [];
   strip.reset(S.turnYaw0); show('strip');
-  setStep(2, title, text);
+  setStep(2, title, text + (S.liveOn ? ' Walls appear on the plan as they are heard.' : ''));
   setRing(0, '0%');
+  if (S.liveOn) { plan.setLive({ ok: true, walls: [], poly: [], edgeWall: [] }, S.turnYaw0); setView('plan'); }
 }
 
 function runLift() {
@@ -288,6 +337,7 @@ function turnProgress(f) {
 
 async function finishScan() {
   S.finished = true;
+  if (S.liveOn) { S.liveOn = false; plan.endLive(); if (S.liveMs.length) { const s = S.liveMs.slice().sort((a, b) => a - b); S.diag.liveMsP95 = s[Math.floor(0.95 * s.length)]; } }
   S.audio.stopTrain();
   setStep(2, 'Building the room', S.spot ? 'Solving the second spot, then fitting it to the first.' : 'Solving the walls, floor and ceiling.');
   const opt = { kappa: S.audio.proc.kappa, bwKHz: (S.band.f1 - S.band.f0) / 1000, persist: true };
@@ -391,6 +441,8 @@ async function simDemo(seed) {
   $('btnStep').hidden = true;
   S.frames = []; S.spot = 0; S.spotRooms = []; S.spotRegs = null; S.calPairs = []; S.cal = null; S.liveBuf = [];
   strip.reset(null); show('strip');
+  S.turnYaw0 = null; S.liveOn = false;
+  startLiveWalls(sim.proc);
   const total = sc.liftDur + sc.turnDur + 0.3;
   let k = 0;
   await new Promise(resolve => {
@@ -402,10 +454,13 @@ async function simDemo(seed) {
         const f = { t, yaw, phase: fr.pose.phase, dir: 1, profile: sim.proc.process(fr.seg, 1).profile, seg: fr.seg };
         if (f.phase === 'lift') f.dz = (fr.pose.pos[2] - sc.z0) * sc.liftScaleErr + sc.liftNoise * Math.sin(2.1 * t + sc.liftNoisePh);
         S.frames.push(f);
+        if (S.frames.length > 2) { const a = S.frames[S.frames.length - 3]; f.omega = (f.yaw - a.yaw) / Math.max(0.05, f.t - a.t); }
+        if (S.liveOn) { if (f.phase === 'turn' && S.turnYaw0 == null) { S.turnYaw0 = yaw; plan.setLive({ ok: true, walls: [], poly: [], edgeWall: [] }, yaw); setView('plan'); } sendLive(f); }
         view.setHeading(yaw);
         const le = liveEchoes(f);
         view.addEchoes(le.echoes);
         if (f.phase === 'turn' && le.residual) strip.add(yaw, le.residual, sim.proc.binSize);
+        if (S.liveOn && f.phase === 'turn') plan.addEchoes(le.echoes, yaw, 0, 0.3);
       }
       setRing(Math.min(1, k * sc.period / total), Math.round(100 * Math.min(1, k * sc.period / total)) + '%');
       if (k * sc.period < total) setTimeout(step, 40); else resolve();
@@ -413,6 +468,7 @@ async function simDemo(seed) {
     step();
   });
   setStep(2, 'Building the room', 'Solving the walls, floor and ceiling.');
+  if (S.liveOn) { await new Promise(r => setTimeout(r, 400)); S.liveOn = false; plan.endLive(); if (S.liveMs.length) { const s = S.liveMs.slice().sort((a, b) => a - b); S.diag.liveMsP95 = s[Math.floor(0.95 * s.length)]; } }
   const res = await solve(S.frames, { kappa: sim.proc.kappa, bwKHz: (sc.band.f1 - sc.band.f0) / 1000, persist: true }, sim.proc);
   hide('scan'); hide('strip');
   if (!res.ok) { toast(res.reason, 4000); show('home'); return; }
@@ -646,8 +702,9 @@ $('btnAbout').onclick = () => sheet('about');
 document.addEventListener('visibilitychange', () => { if (document.hidden && S.radar && S.source === 'live') stopRadar(); });
 
 // test hook (tools/e2e.mjs): screen point of a measured wall on the plan
-window.__et = { wallPoint: (i) => plan.wallPoint(i), wallLabel: (i) => PlanView.wallLabel(S.room, i).text, measuredWalls: () => S.room ? S.room.walls.map((w, i) => w.inferred ? -1 : i).filter(i => i >= 0) : [] };
+window.__et = { live: () => ({ on: !!S.liveOn, models: !!S.liveModels, chirps: (S.liveMs || []).length, shown: S.liveWallsShown || 0 }), wallPoint: (i) => plan.wallPoint(i), wallLabel: (i) => PlanView.wallLabel(S.room, i).text, measuredWalls: () => S.room ? S.room.walls.map((w, i) => w.inferred ? -1 : i).filter(i => i >= 0) : [] };
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+loadLiveModels();
 loadModel().then(() => {
   const q = new URLSearchParams(location.search);
   if (q.has('sim')) simDemo(+q.get('sim') || 5007);
