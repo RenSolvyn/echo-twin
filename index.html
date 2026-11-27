@@ -55,6 +55,7 @@
   <div id="ring" class="ring"><span id="ringText"></span></div>
   <p id="scanHint" class="hint" aria-live="polite"></p>
   <button id="btnStep" class="primary" hidden>Start</button>
+  <button id="btnStep2" class="secondary" hidden>Scan anyway</button>
   <button id="btnCancel" class="link">Cancel</button>
 </section>
 
@@ -87,10 +88,9 @@
 
 <section id="field" class="sheet tall" hidden>
   <h2>Field test</h2>
-  <p>Measure from the spot you turned on (between your feet) straight out to each wall, in the order you turned past them. The numbers are saved with the recording.</p>
-  <label>Wall distances (m), comma separated
-    <input id="fieldWalls" type="text" inputmode="decimal" placeholder="1.42, 2.10, 2.65, 1.88">
-  </label>
+  <p>Put a coin where you turned. For each wall: stand on the coin, hold the phone flat, point its top edge straight at the wall and tap Aim. Then type the distance from the coin to that wall (tape or the iPhone Measure app), in metres. Aim pairs each number with the right wall.</p>
+  <div id="fieldWallList" class="walls"></div>
+  <button id="btnFieldAdd" class="link">Add a wall</button>
   <label>Room height, floor to ceiling (m)
     <input id="fieldRoomH" type="number" step="0.01" min="1.5" max="6">
   </label>

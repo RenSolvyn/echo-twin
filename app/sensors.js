@@ -1,14 +1,18 @@
 // Motion sensors: heading of the phone's bottom edge (unwrapped, from the gyro-fused orientation),
 // and vertical displacement during the lift by zero-velocity-corrected integration of acceleration.
 // Every sample keeps its event timestamp (performance.now() clock) for interpolation at chirp time.
+// v0.6.2: compass heading of the top edge (degrees clockwise from magnetic north): iOS webkitCompassHeading,
+// elsewhere 360 - alpha of an absolute orientation event. The yaw above is not tied to north (iOS alpha starts
+// at an arbitrary direction); the compass lets field-test bearings be matched to walls (core/fieldscore.js).
 
 export class Motion {
   constructor() {
-    this.yawS = []; this.acc = [];
+    this.yawS = []; this.acc = []; this.hdgS = [];
     this.unwrapped = null; this.last = null;
     this.on = false;
     this.orient = (e) => this.onOrient(e);
     this.motion = (e) => this.onMotion(e);
+    this.orientAbs = (e) => this.onCompass(e, true);
   }
 
   // Must run inside a user gesture on iOS.
@@ -26,16 +30,46 @@ export class Motion {
     if (this.on) return;
     window.addEventListener('deviceorientation', this.orient);
     window.addEventListener('devicemotion', this.motion);
+    window.addEventListener('deviceorientationabsolute', this.orientAbs);
     this.on = true;
   }
 
   stop() {
     window.removeEventListener('deviceorientation', this.orient);
     window.removeEventListener('devicemotion', this.motion);
+    window.removeEventListener('deviceorientationabsolute', this.orientAbs);
     this.on = false;
   }
 
+  // Compass sample: iOS gives webkitCompassHeading (and webkitCompassAccuracy, -1 when unknown); an absolute
+  // orientation event gives alpha from north (counterclockwise), so the top edge's heading is 360 - alpha.
+  onCompass(e, absEvent) {
+    let h = null, acc = null;
+    if (typeof e.webkitCompassHeading === 'number' && e.webkitCompassHeading >= 0) { h = e.webkitCompassHeading; acc = e.webkitCompassAccuracy >= 0 ? e.webkitCompassAccuracy : null; }
+    else if ((absEvent || e.absolute === true) && e.alpha != null) h = (360 - e.alpha) % 360;
+    if (h == null) return;
+    this.hdgS.push([e.timeStamp || performance.now(), h, acc]);
+    if (this.hdgS.length > 4000) this.hdgS.splice(0, 1000);
+  }
+
+  // Latest compass reading { deg, acc, ageMs } or null. Time O(1).
+  heading() {
+    const s = this.hdgS[this.hdgS.length - 1];
+    return s ? { deg: s[1], acc: s[2], ageMs: performance.now() - s[0] } : null;
+  }
+
+  // Compass heading at time t (nearest sample within 250 ms), or null. Time O(log n).
+  hdgAt(t) {
+    const S = this.hdgS;
+    if (!S.length) return null;
+    let lo = 0, hi = S.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (S[m][0] <= t) lo = m; else hi = m; }
+    const k = Math.abs(S[lo][0] - t) <= Math.abs(S[hi][0] - t) ? lo : hi;
+    return Math.abs(S[k][0] - t) <= 250 ? S[k][1] : null;
+  }
+
   onOrient(e) {
+    this.onCompass(e, false);
     if (e.alpha == null) return;
     const D = Math.PI / 180;
     const a = e.alpha * D, b = (e.beta || 0) * D, g = (e.gamma || 0) * D;

@@ -9,9 +9,10 @@ import { fitCalibration, applyCalibration, CALIB_SAVE, CALIB_ENABLED } from '../
 import { stereoSetup, STEREO_DEFAULT, nearFar } from '../core/stereo.js';
 import { LIVE_ENABLED, CLOUD_ENABLED } from '../core/live.js';
 import { roomPolygon } from '../core/geom.js';
-import { parseTruth, scoreField, fieldText } from '../core/fieldscore.js';
+import { truthFromRows, scoreField, fieldText, compassFrame } from '../core/fieldscore.js';
 import { persistenceCandidates } from '../core/estimate.js';
 import { SonarAudio } from './audio.js';
+import { SOUND_PATH, AUDIO_MODES, echoScore, pickConfig, candidates } from '../core/soundpath.js';
 import { Motion } from './sensors.js';
 import { BANDS, DEFAULTS, DEVICE_PROFILES, guessDeviceClass, VERSION } from '../core/config.js';
 import { EchoProcessor } from '../core/dsp.js';
@@ -254,42 +255,86 @@ function bandFor(name) { return name === 'audible' ? BANDS.audible : name === 'w
 
 async function allowAndGo() {
   sheet(null);
+  const remembered = store.get('soundPath', null);
   try {
     const perm = await Motion.requestPermission();
     S.diag.motionPermission = perm;
     S.motion.start();
     S.audio = new SonarAudio();
-    const info = await S.audio.open();
+    const info = await S.audio.open(remembered && AUDIO_MODES[remembered.mode] ? remembered.mode : 'pr-off');
     S.diag.audio = info;
   } catch (e) {
     toast('Microphone not available: ' + (e.message || e.name), 4000);
     return;
   }
   hide('home'); hide('bar'); hide('hud'); show('scan'); setView('follow');
-  setStep(0, 'Sound check', 'Listening to one chirp.');
-  setRing(0, '');
   const dev = S.settings.device === 'auto' ? guessDeviceClass(navigator.userAgent) : S.settings.device;
   S.diag.deviceClass = dev; S.deviceClass = dev;
-  let band = bandFor(S.settings.band);
-  const cfg = () => ({ band, period: DEFAULTS.period, rangeOffset: DEVICE_PROFILES[dev].rangeOffset, tempC: S.settings.tempC });
-  S.audio.configure(cfg());
-  let chk = await S.audio.soundCheck();
-  if (chk.snrDb < 18 && S.settings.band === 'auto') {
-    band = BANDS.audible; S.audio.configure(cfg());
-    chk = await S.audio.soundCheck();
-    toast('High band too quiet on this phone; using audible chirps', 2600);
+  setStep(0, 'Sound check', 'Stand about a metre from a flat wall. Hold the phone flat, screen up, bottom edge toward the wall, volume all the way up. Tap Check and keep still.');
+  setRing(0, '');
+  $('btnStep2').hidden = true;
+  $('btnStep').hidden = false; $('btnStep').textContent = 'Check';
+  $('btnStep').onclick = () => runSoundPath(dev, remembered);
+}
+
+// Sound path check (core/soundpath.js): the remembered setting first; if it cannot hear the wall, every audio
+// setting and band is measured and the best kept. Each try: reopen the microphone if the setting changes,
+// time the direct path, then score the wall echo over 14 chirps.
+async function runSoundPath(dev, remembered) {
+  $('btnStep').hidden = true; $('btnStep2').hidden = true;
+  const bandAuto = S.settings.band === 'auto';
+  const list = candidates(remembered, bandAuto, bandAuto ? 'high' : S.settings.band);
+  const cfg = (band) => ({ band: bandFor(band), period: DEFAULTS.period, rangeOffset: DEVICE_PROFILES[dev].rangeOffset, tempC: S.settings.tempC });
+  const tried = [];
+  const r1 = (v) => Number.isFinite(v) ? Math.round(10 * v) / 10 : null;
+  for (let k = 0; k < list.length; k++) {
+    const c = list[k];
+    setStep(0, 'Sound check', `Listening for the wall (${k + 1} of ${list.length}). Keep still.`);
+    setRing(k / list.length, '');
+    try {
+      if (c.mode !== S.audio.mode) await S.audio.reopen(c.mode);
+      S.audio.configure(cfg(c.band));
+      const chk = await S.audio.soundCheck();
+      const frames = await S.audio.echoCheck(SOUND_PATH.chirps);
+      const sc = echoScore(frames, DEFAULTS.binSize, DEFAULTS.minRange);
+      const pk = frames.reduce((m, f) => Math.max(m, f.peakAbs), 0);
+      tried.push({ ...c, echoDb: r1(sc.echoDb) ?? -Infinity, rangeM: sc.rangeM, directDb: r1(sc.directDb) ?? -Infinity, peakDbfs: pk > 0 ? r1(20 * Math.log10(pk)) : null, latencyMs: r1(chk.latencyMs), clipped: chk.clipped, chirps: sc.n, aecReported: S.audio.trackSettings.echoCancellation ?? null });
+    } catch (e) {
+      tried.push({ ...c, echoDb: -Infinity, directDb: -Infinity, error: String(e.message || e.name) });
+    }
+    if (k === 0 && pickConfig(tried).ok) break; // the remembered setting still hears the wall
   }
-  S.diag.soundCheck = { ...chk, band: band.name };
-  S.band = band;
-  if (chk.snrDb < 12) {
-    setStep(0, 'Echo too weak', `Signal ${fmt(chk.snrDb, 0)} dB. Turn the volume up, remove a thick case, and try again.`);
-    $('btnStep').hidden = false; $('btnStep').textContent = 'Try again';
-    $('btnStep').onclick = () => { hide('scan'); S.audio.close(); allowAndGo(); };
+  setRing(1, '');
+  const { best, ok } = pickConfig(tried);
+  // leave the chosen setting active, with its latency measured
+  try {
+    if (best.mode !== S.audio.mode) await S.audio.reopen(best.mode);
+    S.audio.configure(cfg(best.band));
+    S.diag.soundCheck = { ...(await S.audio.soundCheck()), band: best.band };
+  } catch (e) { S.diag.soundCheck = { error: String(e.message || e.name), band: best.band }; }
+  S.diag.audio = S.audio.info();
+  S.diag.soundPath = { tried: tried.map(t => ({ ...t, echoDb: Number.isFinite(t.echoDb) ? t.echoDb : null, directDb: Number.isFinite(t.directDb) ? t.directDb : null })), chosen: { mode: best.mode, band: best.band }, ok, passDb: SOUND_PATH.passDb, directMinDb: SOUND_PATH.directMinDb };
+  S.band = bandFor(best.band);
+  const usable = Number.isFinite(best.directDb) && best.directDb >= SOUND_PATH.directMinDb;
+  if (ok) {
+    store.set('soundPath', { mode: best.mode, band: best.band });
+    toast(`Wall heard at ${fmt(best.rangeM, 2)} m, ${fmt(best.echoDb, 0)} dB over the noise`, 2600);
+    beginLift();
     return;
   }
-  toast(`Sound check ok, ${fmt(chk.snrDb, 0)} dB`);
+  setStep(0, usable ? 'Walls too quiet' : 'Chirp not heard',
+    usable ? `Best wall echo ${fmt(best.echoDb, 0)} dB over the noise (needs ${SOUND_PATH.passDb}), ${tried.length} settings tried. Press volume up to the top while this screen is open, take off a thick case, face a flat wall a metre away, and check again.`
+           : 'The phone cannot hear its own chirp. Turn the volume up, check silent mode and Bluetooth audio, and check again.');
+  $('btnStep').hidden = false; $('btnStep').textContent = 'Check again';
+  $('btnStep').onclick = () => runSoundPath(dev, { mode: best.mode, band: best.band });
+  $('btnStep2').hidden = !usable;
+  $('btnStep2').onclick = () => { toast('Scanning with weak echoes; walls may not be found', 2600); beginLift(); };
+}
+
+function beginLift() {
+  $('btnStep2').hidden = true;
   S.frames = []; S.source = 'live'; S.spot = 0; S.spotRooms = []; S.spotRegs = null; S.calPairs = [];
-  S.cal = CALIB_SAVE ? store.get('calib.' + dev, null) : null;
+  S.cal = CALIB_SAVE ? store.get('calib.' + S.deviceClass, null) : null;
   S.tStart = performance.now();
   S.audio.onFrame = (q) => onScanFrame(q);
   startLiveWalls();
@@ -301,7 +346,7 @@ async function allowAndGo() {
 
 function processFrame(q) {
   const r = S.audio.proc.process(q.seg, q.dir);
-  const f = { t: (q.perf - S.tStart) / 1000, perf: q.perf, yaw: S.motion.yawAt(q.perf + 15), phase: q.phase, dir: q.dir, profile: r.profile, n0: r.n0, snr: r.snrDb, seg: q.seg, spot: S.spot };
+  const f = { t: (q.perf - S.tStart) / 1000, perf: q.perf, yaw: S.motion.yawAt(q.perf + 15), hdg: S.motion.hdgAt(q.perf + 15), phase: q.phase, dir: q.dir, profile: r.profile, n0: r.n0, snr: r.snrDb, seg: q.seg, spot: S.spot };
   // a silent or missing second channel is not a second microphone
   if (q.seg2) {
     let e = 0; for (let i = 0; i < q.seg2.length; i += 8) e += q.seg2[i] * q.seg2[i];
@@ -565,6 +610,7 @@ function exportRecording() {
   const frames = S.frames.map(f => {
     const [sc, seg] = pack(f.seg);
     const o = { t: f.t, yaw: f.yaw, phase: f.phase, dir: f.dir, dz: f.dz, scale: sc, seg };
+    if (Number.isFinite(f.hdg)) o.hdg = Math.round(10 * f.hdg) / 10;
     if (f.spot) o.spot = f.spot;
     if (f.seg2) { const [sc2, seg2] = pack(f.seg2); o.scale2 = sc2; o.seg2 = seg2; }
     return o;
@@ -592,6 +638,7 @@ async function openRecording(file) {
       const seg = Float32Array.from(i16, v => v / f.scale);
       const p0 = proc.process(seg, f.dir);
       const fr = { t: f.t, yaw: f.yaw, phase: f.phase, dir: f.dir, dz: f.dz, spot: f.spot || 0, seg, profile: p0.profile, n0: p0.n0 };
+      if (Number.isFinite(f.hdg)) fr.hdg = f.hdg;
       if (f.seg2) { const seg2 = Float32Array.from(unb64(f.seg2), v => v / f.scale2); const p1 = proc.process(seg2, f.dir); fr.seg2 = seg2; fr.profile2 = p1.profile; fr.n02 = p1.n0; }
       return fr;
     });
@@ -605,7 +652,7 @@ async function openRecording(file) {
     const shown = composeRoom(res);
     cloudForReplay(S.frames, proc);
     showRoom(shown);
-    const fs0 = m.truth ? scoreField(shown, m.truth) : null;
+    const fs0 = m.truth ? scoreField(shown, m.truth, 0.15, fieldCtx()) : null;
     const nSpots = framesBySpot(S.frames).length;
     $('status').textContent = `replay of ${m.date ? m.date.slice(0, 16) : 'recording'}` + (nSpots > 1 ? (!MERGE.enabled ? ', second spot not merged (not reliable yet)' : S.spotRegs && S.spotRegs.ok ? ', 2 spots fitted' : ', second spot not fitted') : '') + (fs0 ? ` | tape: ${Math.round(fs0.recall * fs0.measured)}/${fs0.measured} walls within 15 cm, median error ${fs0.errMedCm == null ? '-' : fs0.errMedCm.toFixed(1)} cm` : '');
     toast(nSpots > 1 && MERGE.enabled && !(S.spotRegs && S.spotRegs.ok) ? 'Recording opened. The second spot could not be fitted: ' + (S.spotRegs ? S.spotRegs.reason : 'it did not solve') : 'Recording opened', 3600);
@@ -730,17 +777,60 @@ $('btnMore').onclick = () => sheet('more');
 $('btnExport').onclick = exportRecording;
 const VIEWS = ['plan', 'follow', 'orbit'];
 $('btnView').onclick = () => { S.userView = VIEWS[(VIEWS.indexOf(S.viewMode || 'plan') + 1) % VIEWS.length]; setView(S.userView); };
+// Field test rows: one decimal box per wall (the iPhone decimal keypad has no comma or space) and an Aim
+// button that stores the compass bearing of the wall, so each tape number is paired with the wall in its
+// direction (core/fieldscore.js), not with whichever sound wall happens to have a similar distance.
+function fieldCtx() {
+  return { frame: compassFrame((S.frames || []).filter(f => (f.spot || 0) === (S.spot || 0))), cloud: plan.cloud || null };
+}
+function fieldWallBoxes(t) {
+  const list = $('fieldWallList'); list.textContent = '';
+  const walls = t ? t.walls : [], hs = t && t.headings ? t.headings : [];
+  for (let i = 0; i < Math.max(4, walls.length); i++) addFieldWall(walls[i], hs[i]);
+}
+function addFieldWall(v, h) {
+  const list = $('fieldWallList'), k = list.children.length;
+  if (k >= 8) { toast('Eight walls at most'); return; }
+  const row = document.createElement('div'); row.className = 'wallRow';
+  const lab = document.createElement('span'); lab.textContent = `Wall ${k + 1}`;
+  const inp = document.createElement('input');
+  inp.type = 'text'; inp.inputMode = 'decimal'; inp.placeholder = ['1.42', '2.10', '2.65', '1.88'][k % 4]; inp.className = 'fieldWall';
+  inp.autocomplete = 'off'; inp.setAttribute('aria-label', `Wall ${k + 1} distance in metres`); if (v != null) inp.value = v;
+  const aim = document.createElement('button'); aim.className = 'aim secondary'; aim.type = 'button';
+  row.dataset.h = Number.isFinite(h) ? String(h) : '';
+  aim.textContent = Number.isFinite(h) ? `${Math.round(h)} deg` : 'Aim';
+  aim.onclick = () => aimWall(row, aim, k);
+  row.append(lab, inp, aim); list.appendChild(row);
+}
+async function aimWall(row, btn, k) {
+  let h = S.motion.heading();
+  if (!h || h.ageMs > 1000) {
+    const perm = await Motion.requestPermission(); S.diag.motionPermission = S.diag.motionPermission || perm;
+    S.motion.start();
+    await new Promise(r => setTimeout(r, 700));
+    h = S.motion.heading();
+  }
+  if (!h || h.ageMs > 1500) { btn.textContent = 'no compass'; toast('No compass reading on this device; distances will be paired by size only', 3000); return; }
+  row.dataset.h = String(Math.round(10 * h.deg) / 10);
+  btn.textContent = `${Math.round(h.deg)} deg`;
+  toast(`Wall ${k + 1} aimed at ${Math.round(h.deg)} deg` + (h.acc != null && h.acc > 25 ? ' (compass unsure; move away from metal)' : ''), 1800);
+}
+function fieldRows() {
+  return Array.from(document.querySelectorAll('#fieldWallList .wallRow')).map(r => ({ d: r.querySelector('.fieldWall').value, h: r.dataset.h === '' ? null : Number(r.dataset.h) }));
+}
+$('btnFieldAdd').onclick = () => addFieldWall();
 $('btnField').onclick = () => {
   const t = S.fieldTruth || store.get('fieldTruth', null);
-  if (t) { $('fieldWalls').value = t.walls.join(', '); $('fieldRoomH').value = t.roomHeight || ''; $('fieldPhoneH').value = t.phoneHeight || ''; }
-  $('fieldOut').textContent = t && S.room ? fieldText(scoreField(S.room, t)) : '';
+  fieldWallBoxes(t);
+  if (t) { $('fieldRoomH').value = t.roomHeight || ''; $('fieldPhoneH').value = t.phoneHeight || ''; }
+  $('fieldOut').textContent = t && S.room ? fieldText(scoreField(S.room, t, 0.15, fieldCtx())) : '';
   sheet('field');
 };
 $('btnFieldScore').onclick = () => {
-  const t = parseTruth($('fieldWalls').value, $('fieldRoomH').value, $('fieldPhoneH').value);
-  if (!t) { $('fieldOut').textContent = 'Enter at least two wall distances in metres, for example 1.42, 2.10, 2.65'; return; }
+  const t = truthFromRows(fieldRows(), $('fieldRoomH').value, $('fieldPhoneH').value);
+  if (!t) { $('fieldOut').textContent = 'Enter at least two wall distances in metres, one per box, for example 1.42'; return; }
   S.fieldTruth = t; store.set('fieldTruth', t);
-  $('fieldOut').textContent = S.room && S.room.ok ? fieldText(scoreField(S.room, t)) : 'Saved. Scan or open a recording to compare.';
+  $('fieldOut').textContent = S.room && S.room.ok ? fieldText(scoreField(S.room, t, 0.15, fieldCtx())) : 'Saved. Scan or open a recording to compare.';
   toast('Measurements saved with this scan');
 };
 $('btnDetails').onclick = details;
@@ -750,7 +840,7 @@ $('btnAbout').onclick = () => sheet('about');
 document.addEventListener('visibilitychange', () => { if (document.hidden && S.radar && S.source === 'live') stopRadar(); });
 
 // test hook (tools/e2e.mjs): screen point of a measured wall on the plan
-window.__et = { cloud: () => ({ updates: S.cloudUpdates || 0, final: !!S.cloudFinal, only: !!S.cloudOnly, ridges: plan.cloudRidgeCount(), dims: $('dims').textContent }), live: () => ({ on: !!S.liveOn, models: !!S.liveModels, chirps: (S.liveMs || []).length, shown: S.liveWallsShown || 0 }), wallPoint: (i) => plan.wallPoint(i), wallLabel: (i) => PlanView.wallLabel(S.room, i).text, measuredWalls: () => S.room ? S.room.walls.map((w, i) => w.inferred ? -1 : i).filter(i => i >= 0) : [] };
+window.__et = { soundPath: () => (S.diag && S.diag.soundPath) || null, step: () => ({ title: $('stepTitle').textContent, text: $('stepText').textContent, b1: $('btnStep').hidden ? null : $('btnStep').textContent, b2: $('btnStep2').hidden ? null : $('btnStep2').textContent }), cloud: () => ({ updates: S.cloudUpdates || 0, final: !!S.cloudFinal, only: !!S.cloudOnly, ridges: plan.cloudRidgeCount(), dims: $('dims').textContent }), live: () => ({ on: !!S.liveOn, models: !!S.liveModels, chirps: (S.liveMs || []).length, shown: S.liveWallsShown || 0 }), wallPoint: (i) => plan.wallPoint(i), wallLabel: (i) => PlanView.wallLabel(S.room, i).text, measuredWalls: () => S.room ? S.room.walls.map((w, i) => w.inferred ? -1 : i).filter(i => i >= 0) : [] };
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
 loadLiveModels();
 loadModel().then(() => {

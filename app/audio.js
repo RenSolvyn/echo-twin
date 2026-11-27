@@ -2,10 +2,13 @@
 // into a ring buffer indexed by audio frame, and cuts one segment per chirp around its direct path.
 // v0.5: asks for two channels; where the browser delivers two, both are cut at the same samples
 // (core/stereo.js decides later whether they come from two distinct microphones).
+// v0.6.2: the microphone can be reopened with another audio setting (core/soundpath.js AUDIO_MODES), and
+// echoCheck() measures whether a wall echo comes back, so the scan uses the setting that actually hears walls.
 
 import { makeChirp, EchoProcessor } from '../core/dsp.js';
 import { fft, nextPow2 } from '../core/fft.js';
 import { DEFAULTS } from '../core/config.js';
+import { AUDIO_MODES } from '../core/soundpath.js';
 
 const RING = 1 << 20;
 
@@ -21,25 +24,74 @@ export class SonarAudio {
     this.latency = null;
   }
 
-  // Must be called from a user gesture (iOS).
-  async open() {
-    if (navigator.audioSession) { try { navigator.audioSession.type = 'play-and-record'; } catch (e) { /* older Safari */ } }
+  // Must be called from a user gesture (iOS). mode: a key of AUDIO_MODES.
+  async open(mode = 'pr-off') {
     const AC = window.AudioContext || window.webkitAudioContext;
+    this.setSession(mode);
     this.ctx = new AC({ latencyHint: 'interactive' });
     if (this.ctx.state === 'suspended') await this.ctx.resume();
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 } }
-    });
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: this.constraints(mode) });
     await this.ctx.audioWorklet.addModule(new URL('../rec-worklet.js', import.meta.url));
-    const src = this.ctx.createMediaStreamSource(this.stream);
     this.node = new AudioWorkletNode(this.ctx, 'echo-rec', { channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'discrete' });
     const mute = this.ctx.createGain(); mute.gain.value = 0;
-    src.connect(this.node); this.node.connect(mute); mute.connect(this.ctx.destination);
+    this.node.connect(mute); mute.connect(this.ctx.destination);
     this.node.port.onmessage = (e) => this.write(e.data.frame, e.data.data, e.data.data2);
+    this.attach();
+    this.mode = mode;
     this.fs = this.ctx.sampleRate;
+    return this.info();
+  }
+
+  setSession(mode) {
+    const m = AUDIO_MODES[mode] || AUDIO_MODES['pr-off'];
+    if (navigator.audioSession) { try { navigator.audioSession.type = m.session; } catch (e) { /* older Safari */ } }
+  }
+  constraints(mode) {
+    const m = AUDIO_MODES[mode] || AUDIO_MODES['pr-off'];
+    return { echoCancellation: m.aec, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 } };
+  }
+  attach() {
+    this.src = this.ctx.createMediaStreamSource(this.stream);
+    this.src.connect(this.node);
     const tr = this.stream.getAudioTracks()[0];
     this.trackSettings = tr && tr.getSettings ? tr.getSettings() : {};
-    return { fs: this.fs, settings: this.trackSettings, channels: this.trackSettings.channelCount ?? null, session: navigator.audioSession ? navigator.audioSession.type : 'n/a' };
+  }
+  info() {
+    return { fs: this.fs, mode: this.mode, settings: this.trackSettings, channels: this.trackSettings.channelCount ?? null, session: navigator.audioSession ? navigator.audioSession.type : 'n/a' };
+  }
+
+  // Reopens the microphone with another audio setting; the recording ring and clock carry on. Safari may move
+  // the output (earpiece or loudspeaker) when the setting changes, so it waits for the route to settle; the
+  // round-trip latency must be measured again (soundCheck) before echoes are cut.
+  async reopen(mode, settleMs = 1000) {
+    if (mode === this.mode) return this.info();
+    this.stopTrain();
+    try { this.src && this.src.disconnect(); } catch (e) { /* already gone */ }
+    if (this.stream) this.stream.getTracks().forEach(t => t.stop());
+    this.setSession(mode);
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: this.constraints(mode) });
+    this.attach();
+    this.mode = mode; this.latency = null; this.ring2 = null;
+    await new Promise(r => setTimeout(r, settleMs));
+    return this.info();
+  }
+
+  // Wall echo check: a short train of chirps, each turned into a range profile exactly as in the scan.
+  // Resolves to the frames ({ profile, snrDb, peakAbs }); scoring is core/soundpath.js echoScore.
+  // Time about n x period.
+  echoCheck(n = 14) {
+    return new Promise((resolve) => {
+      const out = [], prev = this.onFrame;
+      const done = () => { this.stopTrain(); this.onFrame = prev; clearTimeout(guard); resolve(out); };
+      this.onFrame = (q) => {
+        const r = this.proc.process(q.seg, q.dir);
+        let pk = 0; for (const v of q.seg) { const a = Math.abs(v); if (a > pk) pk = a; }
+        out.push({ profile: r.profile, snrDb: r.snrDb, peakAbs: pk });
+        if (out.length >= n) done();
+      };
+      const guard = setTimeout(done, 1000 * (n * this.period + 2));
+      this.startTrain({ phase: 'check' });
+    });
   }
 
   write(frame, data, data2) {
